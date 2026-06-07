@@ -55,11 +55,14 @@ uv run swisspost-independent-verifier config ../e-voting/secure-data-manager/sec
 uv run swisspost-independent-verifier tally ../e-voting/secure-data-manager/secure-data-manager-backend/src/test/resources/MixOfflineFacadeTest
 uv run swisspost-independent-verifier config ../testdata/election-events/Post_E2E_DEV
 uv run swisspost-independent-verifier tally ../testdata/election-events/Post_E2E_DEV
-uv run swisspost-independent-verifier config --trust-store path/to/certificates ../e-voting/secure-data-manager/secure-data-manager-backend/src/test/resources/MixOfflineFacadeTest
+uv run swisspost-independent-verifier config --trust-store ../testdata/direct-trust ../e-voting/secure-data-manager/secure-data-manager-backend/src/test/resources/MixOfflineFacadeTest
 ```
 
 `uv sync` creates a local `.venv` and installs the verifier in editable form, so the
 commands above do not depend on the global Python environment or `PYTHONPATH`.
+The optional `--trust-store` directory may contain signer certificates (`.pem`,
+`.crt`, `.cer`, `.der`) or direct-trust PKCS#12 keystores (`.p12`) with sibling
+`local_direct_trust_pw_*.txt` password files.
 
 The `../testdata/election-events/Post_E2E_DEV` path is the public synthetic end-to-end
 test dataset from `https://gitlab.com/swisspost-evoting/e-voting/testdata.git`. The

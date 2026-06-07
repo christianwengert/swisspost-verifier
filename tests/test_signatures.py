@@ -11,6 +11,7 @@ from pathlib import Path
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.x509.oid import NameOID
 
 from swisspost_independent_verifier.crypto import GqGroup, recursive_hash
@@ -68,6 +69,40 @@ class SignatureTests(unittest.TestCase):
                 )
             )
 
+    def test_trust_store_loads_direct_trust_pkcs12_recursively(self):
+        private_key, certificate = make_certificate("control_component_1")
+        password = b"secret"
+        with tempfile.TemporaryDirectory() as dirname:
+            keystore_dir = Path(dirname) / "control-component" / "control_component_1"
+            keystore_dir.mkdir(parents=True)
+            keystore_path = keystore_dir / "local_direct_trust_keystore_control_component_1.p12"
+            password_path = keystore_dir / "local_direct_trust_pw_control_component_1.txt"
+            keystore_path.write_bytes(
+                pkcs12.serialize_key_and_certificates(
+                    name=b"control_component_1",
+                    key=private_key,
+                    cert=certificate,
+                    cas=None,
+                    encryption_algorithm=serialization.BestAvailableEncryption(password),
+                )
+            )
+            password_path.write_text(password.decode("ascii"), encoding="utf-8")
+
+            trust_store = TrustStore.from_directory(dirname)
+            message = "payload-digest"
+            context = ("ballotbox", 1, "EE", "BB")
+            signature = sign(private_key, signed_message_digest(message, context))
+
+            self.assertTrue(
+                trust_store.verify_signature(
+                    "control_component_1",
+                    message,
+                    context,
+                    {"signatureContents": base64.b64encode(signature).decode("ascii")},
+                    at=datetime.now(timezone.utc),
+                )
+            )
+
     def test_setup_payload_signature_digests_change_when_payload_changes(self):
         context_payload, setup_keys, tally_data, _, _ = load_fixture_payloads()
         group = GqGroup.from_json(setup_keys["encryptionGroup"])
@@ -116,7 +151,8 @@ class SignatureTests(unittest.TestCase):
     def test_signed_payload_data_matches_recursive_hash_base64_shape(self):
         _, setup_keys, _, _, _ = load_fixture_payloads()
         group = GqGroup.from_json(setup_keys["encryptionGroup"])
-        digest = setup_public_keys_signed_data(group, setup_keys)
+        message = setup_public_keys_signed_data(group, setup_keys)
+        digest = base64.b64encode(recursive_hash(message)).decode("ascii")
 
         self.assertEqual(32, len(base64.b64decode(digest)))
         self.assertNotEqual(base64.b64encode(recursive_hash(digest)).decode("ascii"), digest)
@@ -212,6 +248,19 @@ class SignatureTests(unittest.TestCase):
 
             self.assertTrue(ok, detail)
 
+    def test_xml_signature_verifier_accepts_ech_signature_in_extension(self):
+        private_key, certificate = make_certificate("sdm_tally")
+        with tempfile.TemporaryDirectory() as dirname:
+            cert_path = Path(dirname) / "sdm_tally.pem"
+            cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+            xml_path = Path(dirname) / "eCH-0222.xml"
+            xml_path.write_bytes(make_signed_ech_xml(private_key, extension_element="extension"))
+
+            trust_store = TrustStore.from_directory(dirname)
+            ok, detail = trust_store.verify_xml_signature("sdm_tally", xml_path, signature_location="extensions-child")
+
+            self.assertTrue(ok, detail)
+
     def test_xml_signature_verifier_rejects_invalid_repository_fixture(self):
         _, certificate = make_certificate("canton")
         with tempfile.TemporaryDirectory() as dirname:
@@ -279,17 +328,17 @@ def make_signed_config_xml(private_key) -> bytes:
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8")
 
 
-def make_signed_ech_xml(private_key) -> bytes:
+def make_signed_ech_xml(private_key, extension_element: str = "extensions") -> bytes:
     root = etree.Element("ech0222")
     raw_data = etree.SubElement(root, "rawData")
-    extensions = etree.SubElement(raw_data, "extensions")
+    extensions = etree.SubElement(raw_data, extension_element)
     etree.SubElement(raw_data, "ballot").text = "demo"
     append_xml_signature(root, private_key, signature_parent=extensions)
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8")
 
 
 def append_xml_signature(root, private_key, signature_parent=None) -> None:
-    digest = hashlib.sha256(etree.tostring(root, method="c14n", exclusive=True, with_comments=False)).digest()
+    digest = hashlib.sha256(etree.tostring(root, method="c14n", exclusive=False, with_comments=False)).digest()
     signature = etree.Element(f"{{{DSIG_NS}}}Signature", nsmap={"ds": DSIG_NS})
     signed_info = etree.SubElement(signature, f"{{{DSIG_NS}}}SignedInfo")
     etree.SubElement(signed_info, f"{{{DSIG_NS}}}CanonicalizationMethod", Algorithm=EXCLUSIVE_C14N)

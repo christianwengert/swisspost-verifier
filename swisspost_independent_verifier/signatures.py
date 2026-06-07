@@ -13,6 +13,8 @@ from cryptography import x509
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.serialization import pkcs12
+from cryptography.x509.oid import NameOID
 
 from .crypto import GqGroup, b64_to_int, recursive_hash
 
@@ -49,8 +51,8 @@ def signed_message_digest(message: Any, context: Sequence[Any]) -> bytes:
     return recursive_hash(message, tuple(context))
 
 
-def signed_payload_data(message: Any) -> str:
-    return base64.b64encode(recursive_hash(message)).decode("ascii")
+def signed_payload_data(message: Any) -> Any:
+    return message
 
 
 @dataclass(frozen=True)
@@ -77,7 +79,7 @@ class TrustStore:
     @classmethod
     def from_directory(cls, path: str | Path) -> "TrustStore":
         certificates: dict[str, CertificateEntry] = {}
-        for cert_path in sorted(Path(path).iterdir()):
+        for cert_path in sorted(Path(path).rglob("*")):
             if cert_path.suffix.lower() not in {".pem", ".crt", ".cer", ".der"}:
                 continue
             data = cert_path.read_bytes()
@@ -85,7 +87,18 @@ class TrustStore:
                 certificate = x509.load_pem_x509_certificate(data)
             except ValueError:
                 certificate = x509.load_der_x509_certificate(data)
-            certificates[cert_path.stem] = CertificateEntry(certificate)
+            entry = CertificateEntry(certificate)
+            for signer_id in _certificate_signer_ids(cert_path, certificate):
+                certificates[signer_id] = entry
+        for keystore_path in sorted(Path(path).rglob("*.p12")):
+            signer_id = _signer_id_from_pkcs12_path(keystore_path)
+            password = _pkcs12_password(keystore_path, signer_id)
+            _, certificate, additional_certificates = pkcs12.load_key_and_certificates(keystore_path.read_bytes(), password)
+            certificate = certificate or (additional_certificates[0] if additional_certificates else None)
+            if certificate is not None:
+                entry = CertificateEntry(certificate)
+                for alias in {signer_id, _certificate_common_name(certificate)} - {""}:
+                    certificates[alias] = entry
         return cls(certificates)
 
     def verify_signature(
@@ -156,8 +169,8 @@ def verify_xml_signature(
         return False, "signature is not the last child of the root element"
     if signature_location == "extensions-child":
         parent = signature.getparent()
-        if parent is None or etree.QName(parent).localname != "extensions":
-            return False, "signature is not embedded in an extensions element"
+        if parent is None or etree.QName(parent).localname not in {"extension", "extensions"}:
+            return False, "signature is not embedded in an extension element"
 
     signed_info = _single_xml_child(signature, "SignedInfo")
     signature_value = _single_xml_child_text(signature, "SignatureValue")
@@ -183,7 +196,7 @@ def verify_xml_signature(
         return False, "could not apply enveloped-signature transform"
     transformed_signature = transformed_signatures[0]
     transformed_signature.getparent().remove(transformed_signature)
-    canonical_document = etree.tostring(transformed_root, method="c14n", exclusive=True, with_comments=False)
+    canonical_document = etree.tostring(transformed_root, method="c14n", exclusive=False, with_comments=False)
     actual_digest = hashlib.sha256(canonical_document).digest()
     if actual_digest != expected_digest:
         return False, "digest mismatch"
@@ -205,6 +218,38 @@ def verify_xml_signature(
     except InvalidSignature:
         return False, "signature mismatch"
     return True, ""
+
+
+def _signer_id_from_pkcs12_path(path: Path) -> str:
+    stem = path.stem
+    prefix = "local_direct_trust_keystore_"
+    if stem.startswith(prefix):
+        return stem[len(prefix) :]
+    return stem
+
+
+def _certificate_signer_ids(path: Path, certificate: x509.Certificate) -> set[str]:
+    signer_ids = {path.stem, _certificate_common_name(certificate)}
+    prefix = "local_direct_trust_keystore_"
+    if path.stem.startswith(prefix):
+        signer_ids.add(path.stem[len(prefix) :])
+    return signer_ids - {""}
+
+
+def _certificate_common_name(certificate: x509.Certificate) -> str:
+    common_names = certificate.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+    return common_names[0].value if common_names else ""
+
+
+def _pkcs12_password(path: Path, signer_id: str) -> bytes | None:
+    candidates = [
+        path.with_name(f"local_direct_trust_pw_{signer_id}.txt"),
+        path.with_suffix(".txt"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.read_text(encoding="utf-8").strip().encode("utf-8")
+    return None
 
 
 def setup_public_keys_signed_data(group: GqGroup, payload: dict[str, Any]) -> str:
@@ -279,7 +324,7 @@ def election_event_context_signed_data(group: GqGroup, payload: dict[str, Any]) 
                 "true" if vcs_ctx["testBallotBox"] else "false",
                 vcs_ctx["numberOfEligibleVoters"],
                 vcs_ctx["gracePeriod"],
-                hp_table,
+                (hp_table,),
                 tuple(vcs_ctx["domainsOfInfluence"]),
             )
         )
@@ -308,7 +353,7 @@ def election_event_context_signed_data(group: GqGroup, payload: dict[str, Any]) 
 
 def control_component_ballot_box_signed_data(group: GqGroup, payload: dict[str, Any]) -> str:
     votes = []
-    for vote in payload["confirmedEncryptedVotes"]:
+    for vote in sorted(payload["confirmedEncryptedVotes"], key=lambda item: item["contextIds"]["verificationCardId"]):
         ids = vote["contextIds"]
         votes.append(
             (
@@ -342,12 +387,13 @@ def control_component_shuffle_signed_data(group: GqGroup, payload: dict[str, Any
         tuple(_ciphertext_tuple(ciphertext) for ciphertext in decryptions["ciphertexts"]),
         tuple(_proof_tuple(proof) for proof in decryptions["decryptionProofs"]),
     )
-    return signed_payload_data((group.as_hash_tuple(), payload["electionEventId"], payload["ballotBoxId"], h_shuffle, h_decryption))
+    return signed_payload_data((group.as_hash_tuple(), payload["electionEventId"], payload["ballotBoxId"], payload["nodeId"], h_shuffle, h_decryption))
 
 
-def tally_component_shuffle_signed_data(payload: dict[str, Any]) -> str:
+def tally_component_shuffle_signed_data(payload: dict[str, Any]) -> Any:
     shuffle = payload["verifiableShuffle"]
     plaintext_decryption = payload["verifiablePlaintextDecryption"]
+    group = GqGroup.from_json(payload["encryptionGroup"])
     h_shuffle = (
         tuple(_ciphertext_tuple(ciphertext) for ciphertext in shuffle["shuffledCiphertexts"]),
         _shuffle_argument_tuple(shuffle["shuffleArgument"]),
@@ -356,7 +402,7 @@ def tally_component_shuffle_signed_data(payload: dict[str, Any]) -> str:
         tuple(tuple(_b64_vector(message["message"])) for message in plaintext_decryption["decryptedVotes"]),
         tuple(_proof_tuple(proof) for proof in plaintext_decryption["decryptionProofs"]),
     )
-    return signed_payload_data((payload["electionEventId"], payload["ballotBoxId"], h_shuffle, h_decryption))
+    return signed_payload_data((group.as_hash_tuple(), payload["electionEventId"], payload["ballotBoxId"], h_shuffle, h_decryption))
 
 
 def tally_component_votes_signed_data(group: GqGroup, payload: dict[str, Any]) -> str:
@@ -396,8 +442,8 @@ def _b64_vector(values: Sequence[str]) -> tuple[int, ...]:
     return tuple(b64_to_int(value) for value in values)
 
 
-def _ciphertext_tuple(ciphertext: dict[str, Any]) -> tuple[int, tuple[int, ...]]:
-    return b64_to_int(ciphertext["gamma"]), _b64_vector(ciphertext["phis"])
+def _ciphertext_tuple(ciphertext: dict[str, Any]) -> tuple[int, ...]:
+    return (b64_to_int(ciphertext["gamma"]), *_b64_vector(ciphertext["phis"]))
 
 
 def _proof_tuple(proof: dict[str, Any]) -> tuple[int, Any]:
@@ -418,9 +464,11 @@ def _shuffle_argument_tuple(argument: dict[str, Any]) -> tuple[Any, ...]:
 
 
 def _product_argument_tuple(argument: dict[str, Any]) -> tuple[Any, ...]:
+    if "c_b" not in argument:
+        return (_single_value_product_argument_tuple(argument["singleValueProductArgument"]),)
     return (
-        b64_to_int(argument.get("c_b", "")) if "c_b" in argument else (),
-        _hadamard_argument_tuple(argument["hadamardArgument"]) if "hadamardArgument" in argument else (),
+        b64_to_int(argument["c_b"]),
+        _hadamard_argument_tuple(argument["hadamardArgument"]),
         _single_value_product_argument_tuple(argument["singleValueProductArgument"]),
     )
 
