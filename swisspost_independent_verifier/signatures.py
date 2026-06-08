@@ -224,7 +224,7 @@ def _signer_id_from_pkcs12_path(path: Path) -> str:
     stem = path.stem
     prefix = "local_direct_trust_keystore_"
     if stem.startswith(prefix):
-        return stem[len(prefix) :]
+        return stem[len(prefix):]
     return stem
 
 
@@ -232,7 +232,7 @@ def _certificate_signer_ids(path: Path, certificate: x509.Certificate) -> set[st
     signer_ids = {path.stem, _certificate_common_name(certificate)}
     prefix = "local_direct_trust_keystore_"
     if path.stem.startswith(prefix):
-        signer_ids.add(path.stem[len(prefix) :])
+        signer_ids.add(path.stem[len(prefix):])
     return signer_ids - {""}
 
 
