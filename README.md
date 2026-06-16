@@ -3,6 +3,9 @@
 This is a Python verifier implemented from the public Swiss Post verifier, system, and crypto-primitives specifications.
 It intentionally does not import or call the Java/TypeScript implementation.
 
+
+This software has been made with a lot of AI help, notably codex.
+
 Current scope:
 
 - Fiat-Shamir proof verifiers from the crypto-primitives specification:
